@@ -252,7 +252,7 @@ def download_builder_preview_pdf(
 		frappe.throw(_("No document available to preview"))
 
 	frappe.local.response.filename = "preview.pdf"
-	frappe.local.response.filecontent = generator.render_pdf()
+	frappe.local.response.filecontent = generator.render_pdf(run_after_print=False)
 	frappe.local.response.type = "pdf"
 
 
@@ -490,12 +490,25 @@ class PrintFormatGenerator:
 
 	# ----- PDF (Chrome) --------------------------------------------------
 
-	def render_pdf(self, password=None):
+	def render_pdf(self, password=None, run_after_print=True):
 		"""Return PDF bytes using the format's renderer.
 
 		Renderers other than the built-in Chromium are resolved through the
 		`pdf_generator` hook, so an app can register its own the same way the
-		Typst renderer is."""
+		Typst renderer is.
+
+		`after_print` handlers of the document run on the unencrypted PDF; the
+		password is applied afterwards. Previews of unsaved formats skip them."""
+		from frappe.utils.pdf import encrypt_pdf
+		from frappe.utils.print_utils import has_after_print_hook, run_after_print_hook
+
+		if not (run_after_print and has_after_print_hook(self.doc.doctype)):
+			return self._render_pdf(password)
+
+		pdf = run_after_print_hook(self.doc.doctype, self.doc.name, self._render_pdf(), doc=self.doc)
+		return encrypt_pdf(pdf, password) if password else pdf
+
+	def _render_pdf(self, password=None):
 		from frappe.utils.pdf import get_chrome_pdf
 
 		pf = self.print_format

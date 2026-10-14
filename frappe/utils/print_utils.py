@@ -93,7 +93,7 @@ def get_print(
 	"""
 	import copy
 
-	from frappe.utils.pdf import get_pdf
+	from frappe.utils.pdf import encrypt_pdf
 	from frappe.website.serve import get_response_without_exception_handling
 
 	local = frappe.local
@@ -101,6 +101,10 @@ def get_print(
 	generator = resolve_pdf_generator(pf_doc, local.form_dict.get("pdf_generator") or pdf_generator)
 
 	settings = settings or local.form_dict.get("settings")
+
+	if as_pdf and doc is None and has_after_print_hook(doctype):
+		# render and post-process the same document instance (before_print / after_print)
+		doc = frappe.get_doc(doctype, name)
 
 	original_form_dict = copy.deepcopy(local.form_dict)
 	try:
@@ -169,37 +173,103 @@ def get_print(
 
 		_run_print_pdf_hooks(doctype, name, print_format)
 
-		hook_func = frappe.get_hooks("pdf_generator")
-		for hook in hook_func:
-			"""
-			check pdf_generator value in your hook function.
-			if it matches run and return pdf else return None
-			"""
-			# nosemgrep: frappe-semgrep-rules.rules.security.frappe-codeinjection-eval
-			pdf = frappe.call(
-				hook,
-				print_format=print_format,
-				html=html,
-				options=pdf_options,
-				output=output,
-				pdf_generator=generator,
-			)
-			# if hook returns a value, assume it was the correct pdf_generator and return it
-			if pdf:
-				if output and isinstance(pdf, bytes):
-					from io import BytesIO
+		if has_after_print_hook(doctype):
+			# handlers get the plain PDF; encryption and merging into `output` happen afterwards
+			plain_options = {key: value for key, value in pdf_options.items() if key != "password"}
+			pdf = _render_html_pdf(html, plain_options, None, print_format, generator)
+			pdf = run_after_print_hook(doctype, name, pdf, doc=doc)
+			if output:
+				from io import BytesIO
 
-					from pypdf import PdfReader
+				from pypdf import PdfReader
 
-					reader = PdfReader(BytesIO(pdf))
-					for page in reader.pages:
-						output.add_page(page)
-					return output
-				return pdf
+				output.append_pages_from_reader(PdfReader(BytesIO(pdf)))
+				return output
+			return encrypt_pdf(pdf, password) if password else pdf
 
-		return get_pdf(html, options=pdf_options, output=output, print_format=print_format)
+		return _render_html_pdf(html, pdf_options, output, print_format, generator)
 	finally:
 		local.form_dict = original_form_dict
+
+
+def _render_html_pdf(html, pdf_options, output, print_format, generator):
+	"""PDF of printview HTML through a `pdf_generator` hook, or the built-in Chromium."""
+	from frappe.utils.pdf import get_pdf
+
+	hook_func = frappe.get_hooks("pdf_generator")
+	for hook in hook_func:
+		"""
+		check pdf_generator value in your hook function.
+		if it matches run and return pdf else return None
+		"""
+		# nosemgrep: frappe-semgrep-rules.rules.security.frappe-codeinjection-eval
+		pdf = frappe.call(
+			hook,
+			print_format=print_format,
+			html=html,
+			options=pdf_options,
+			output=output,
+			pdf_generator=generator,
+		)
+		# if hook returns a value, assume it was the correct pdf_generator and return it
+		if pdf:
+			if output and isinstance(pdf, bytes):
+				from io import BytesIO
+
+				from pypdf import PdfReader
+
+				reader = PdfReader(BytesIO(pdf))
+				for page in reader.pages:
+					output.add_page(page)
+				return output
+			return pdf
+
+	return get_pdf(html, options=pdf_options, output=output, print_format=print_format)
+
+
+def has_after_print_hook(doctype: str | None) -> bool:
+	"""Whether the controller or an app handles the `after_print` event of this DocType."""
+	if not doctype:
+		return False
+
+	doc_events = frappe.get_doc_hooks()
+	if doc_events.get(doctype, {}).get("after_print") or doc_events.get("*", {}).get("after_print"):
+		return True
+
+	from frappe.model.base_document import get_controller
+
+	try:
+		return callable(getattr(get_controller(doctype), "after_print", None))
+	except (ImportError, frappe.DoesNotExistError):
+		return False
+
+
+def run_after_print_hook(doctype: str, name: str, pdf: bytes, doc=None) -> bytes:
+	"""Pass a generated PDF through the `after_print` handlers of its document.
+
+	Handlers receive the unencrypted PDF bytes and return modified bytes, or None to keep
+	the PDF. Each handler gets the result of the previous one (controller method first,
+	then `doc_events` in hook order), so several apps can post-process the same PDF.
+	"""
+	from frappe.model.document import Document
+
+	if not pdf or not has_after_print_hook(doctype):
+		return pdf
+
+	if not isinstance(doc, Document):
+		doc = frappe.get_doc(doctype, name)
+
+	controller_method = getattr(doc, "after_print", None)
+	if callable(controller_method):
+		pdf = controller_method(pdf=pdf) or pdf
+
+	doc_events = frappe.get_doc_hooks()
+	for handler in doc_events.get(doctype, {}).get("after_print", []) + doc_events.get("*", {}).get(
+		"after_print", []
+	):
+		pdf = frappe.get_attr(handler)(doc, "after_print", pdf=pdf) or pdf
+
+	return pdf
 
 
 def _render_builder_pdf(
@@ -235,7 +305,7 @@ def attach_print(
 ):
 	from frappe.translate import print_language
 	from frappe.utils import scrub_urls
-	from frappe.utils.pdf import get_pdf
+	from frappe.utils.pdf import encrypt_pdf, get_pdf
 
 	print_settings = frappe.db.get_singles_dict("Print Settings")
 	kwargs = dict(
@@ -263,7 +333,10 @@ def attach_print(
 			content = ""
 			if cint(print_settings.send_print_as_pdf):
 				ext = ".pdf"
-				if html:
+				if html and has_after_print_hook(doctype):
+					content = run_after_print_hook(doctype, name, get_pdf(html), doc=doc)
+					content = encrypt_pdf(content, password) if password else content
+				elif html:
 					content = get_pdf(html, options={"password": password} if password else None)
 				elif render_via_generator:
 					from frappe.www.printview import validate_print_for_docstatus
